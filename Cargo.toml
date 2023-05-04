@@ -1,0 +1,13 @@
+[package]
+name = "dcl-auth-websocket"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dcl-crypto = "0.1.0"
+fastrand = "1.9.0"
+futures-util = "0.3.28"
+tokio = { version = "1.28.0" }
+warp = "0.3.5"
