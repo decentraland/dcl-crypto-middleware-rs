@@ -1,13 +1,21 @@
 [package]
-name = "dcl-auth-websocket"
+name = "dcl-crypto-middleware-rs"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-dcl-crypto = "0.1.0"
-fastrand = "1.9.0"
-futures-util = "0.3.28"
-tokio = { version = "1.28.0" }
-warp = "0.3.5"
+async-trait = {version = "0.1.68", optional = true}
+dcl-crypto = "0.2.1"
+fastrand = { version = "1.9.0", optional = true }
+log = "0.4.17"
+tokio = { version = "1.28.0", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[features]
+default = ["ws", "signed_fetch"]
+ws = ["dep:fastrand", "dep:async-trait", "dep:tokio"]
+signed_fetch = []
