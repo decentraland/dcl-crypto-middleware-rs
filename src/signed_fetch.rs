@@ -19,8 +19,10 @@ pub enum AuthMiddlewareError {
     InvalidTimestamp,
     /// The provided metadata within headers is not valid. It's empty.
     InvalidMetadata,
-    /// The request is unauthorized to continue because it expires or the signature is not valid
+    /// The request is unauthorized because the signature is not valid
     Unauthotized,
+    /// The request's timestamp expired so the request is unauthorized
+    Expired,
 }
 
 /// Options that must be provided to [`verify`] function
@@ -47,6 +49,8 @@ pub async fn verify<T: Web3Transport>(
     headers: HashMap<String, String>,
     options: VerificationOptions<T>,
 ) -> Result<Address, AuthMiddlewareError> {
+    let headers = normalize_headers(headers);
+
     let auth_chain = extract_auth_chain(&headers)?;
 
     let timestamp = if let Some(ts) = headers.get(AUTH_TIMESTAMP_HEADER) {
@@ -63,11 +67,11 @@ pub async fn verify<T: Web3Transport>(
         return Err(AuthMiddlewareError::InvalidMetadata);
     };
 
-    let payload = create_payload(&method.to_ascii_lowercase(), path, timestamp, metadata);
+    let payload = create_payload(method, path, timestamp, metadata);
 
     let exp = options.expirtation.unwrap_or(DEFAULT_EXPIRATION);
 
-    verify_expirtation(ts_number, exp)?;
+    verify_expiration(ts_number, exp)?;
 
     verify_sign(options.authenticator, auth_chain, &payload).await
 }
@@ -89,13 +93,20 @@ fn extract_auth_chain(headers: &HashMap<String, String>) -> Result<AuthChain, Au
     Ok(AuthChain::from(auth_links))
 }
 
+fn normalize_headers(headers: HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, val)| (key.to_ascii_lowercase(), val.clone()))
+        .collect::<HashMap<String, String>>()
+}
+
 fn verify_ts(ts: &str) -> Result<u128, AuthMiddlewareError> {
     ts.parse::<u128>()
         .map_err(|_| AuthMiddlewareError::InvalidTimestamp)
 }
 
 fn create_payload(method: &str, path: &str, timestamp: &str, metadata: &str) -> String {
-    [method, path, timestamp, metadata].join(":")
+    [method, path, timestamp, metadata].join(":").to_lowercase()
 }
 
 async fn verify_sign<T: Web3Transport>(
@@ -110,7 +121,7 @@ async fn verify_sign<T: Web3Transport>(
         .to_owned())
 }
 
-fn verify_expirtation(ts: u128, expiration: u32) -> Result<(), AuthMiddlewareError> {
+fn verify_expiration(ts: u128, expiration: u32) -> Result<(), AuthMiddlewareError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("not unix epoch time")
@@ -119,7 +130,7 @@ fn verify_expirtation(ts: u128, expiration: u32) -> Result<(), AuthMiddlewareErr
     let expected = ts + expiration as u128;
 
     if expected < now {
-        return Err(AuthMiddlewareError::Unauthotized);
+        return Err(AuthMiddlewareError::Expired);
     }
 
     Ok(())
@@ -132,6 +143,46 @@ mod tests {
     use crate::create_test_identity;
 
     use super::*;
+
+    #[tokio::test]
+    async fn verify_should_return_ok() {
+        let identity = create_test_identity();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let chain = identity.sign_payload(format!("get:/:{}:{}", now, "{}"));
+
+        // Should return OK if the headers are not lowercased
+        let mapped_headers = HashMap::from([
+            (
+                "X-Identity-Auth-Chain-0".to_string(),
+                serde_json::to_string(chain.get(0).unwrap()).unwrap(),
+            ),
+            (
+                "X-Identity-Auth-Chain-1".to_string(),
+                serde_json::to_string(chain.get(1).unwrap()).unwrap(),
+            ),
+            (
+                "X-Identity-Auth-Chain-2".to_string(),
+                serde_json::to_string(chain.get(2).unwrap()).unwrap(),
+            ),
+            ("X-Identity-Timestamp".to_string(), format!("{}", now)),
+            ("X-Identity-Metadata".to_string(), "{}".to_string()),
+        ]);
+
+        verify(
+            "GET",
+            "/",
+            mapped_headers,
+            VerificationOptions {
+                authenticator: Authenticator::new(),
+                expirtation: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn verify_should_return_err() {
@@ -265,6 +316,46 @@ mod tests {
             )
             .await
             .unwrap_err(),
+            AuthMiddlewareError::Expired
+        ));
+
+        let identity = create_test_identity();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let chain = identity.sign_payload(format!("get:/api/events:{}:{}", now, "{}"));
+
+        // Should return OK if the headers are not lowercased
+        let mapped_headers = HashMap::from([
+            (
+                "X-Identity-Auth-Chain-0".to_string(),
+                serde_json::to_string(chain.get(0).unwrap()).unwrap(),
+            ),
+            (
+                "X-Identity-Auth-Chain-1".to_string(),
+                serde_json::to_string(chain.get(1).unwrap()).unwrap(),
+            ),
+            (
+                "X-Identity-Auth-Chain-2".to_string(),
+                serde_json::to_string(chain.get(2).unwrap()).unwrap(),
+            ),
+            ("X-Identity-Timestamp".to_string(), format!("{}", now)),
+            ("X-Identity-Metadata".to_string(), "{}".to_string()),
+        ]);
+
+        assert!(matches!(
+            verify(
+                "GET",
+                "/",
+                mapped_headers,
+                VerificationOptions {
+                    authenticator: Authenticator::new(),
+                    expirtation: None,
+                },
+            )
+            .await
+            .unwrap_err(),
             AuthMiddlewareError::Unauthotized
         ));
     }
@@ -376,7 +467,7 @@ mod tests {
             .unwrap()
             .as_millis();
 
-        assert!(verify_expirtation(now, DEFAULT_EXPIRATION).is_ok());
+        assert!(verify_expiration(now, DEFAULT_EXPIRATION).is_ok());
     }
 
     #[test]
@@ -388,6 +479,6 @@ mod tests {
             .unwrap()
             .as_millis();
 
-        assert!(verify_expirtation(past, DEFAULT_EXPIRATION).is_err());
+        assert!(verify_expiration(past, DEFAULT_EXPIRATION).is_err());
     }
 }
