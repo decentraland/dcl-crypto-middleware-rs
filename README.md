@@ -1,27 +1,10 @@
-# dcl-auth-websocket
+# Decentraland Authentication Middleware for Rust
 
-Authenticate a WebSocket Connection using the Decentraland's Authchain on a [warp](https://github.com/seanmonstar/warp) server
+Utils to authenticate a DCL user using the [Authchain](https://docs.decentraland.org/contributor/auth/authchain)
 
-## Example
-```rust
-use dcl_crypto::{AuthChain, Authenticator};
-use futures_util::{SinkExt, StreamExt};
-use tokio::time::{timeout, Duration};
-use warp::{
-    ws::{Message, WebSocket},
-    Filter,
-};
-use dcl_auth_websocket::authenticate_dcl_user
+This crate aims to provide all the utilities needed for authenticating an user when creating a new Rust service. 
+It can be compared to this [library](https://github.com/decentraland/decentraland-crypto-middleware) for TS
 
-#[tokio::main]
-async fn main() {
-    let routes = warp::path("ws")
-        .and(warp::ws())
-        .map(|ws: warp::ws::Ws| ws.on_upgrade(|ws| async move {
-            let (ws, user_address) = authenticate_dcl_user(ws, 30).await;
-            //....
-        }));
-
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
-}
-```
+It provides:
+- A mechanism for authenticating a WS conneciton. 
+- A verification function for signed fetches to be called as a middleware on a HTTP Server.
