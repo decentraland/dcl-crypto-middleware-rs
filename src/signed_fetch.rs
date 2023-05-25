@@ -1,5 +1,7 @@
 // This was built following the https://adr.decentraland.org/adr/ADR-44
-use dcl_crypto::{Address, AuthChain, AuthLink, Authenticator, Web3Transport};
+use dcl_crypto::{
+    authenticator::WithoutTransport, Address, AuthChain, AuthLink, Authenticator, Web3Transport,
+};
 use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
@@ -31,6 +33,31 @@ pub struct VerificationOptions<T> {
     authenticator: Authenticator<T>,
     /// Optional expiration time. The default is `1000 * 60` ms
     expirtation: Option<u32>,
+}
+
+impl Default for VerificationOptions<WithoutTransport> {
+    fn default() -> Self {
+        Self {
+            authenticator: Authenticator::new(),
+            expirtation: None,
+        }
+    }
+}
+
+impl<T> VerificationOptions<T> {
+    pub fn with_authenticator(self, authenticator: Authenticator<T>) -> Self {
+        Self {
+            authenticator,
+            expirtation: self.expirtation,
+        }
+    }
+
+    pub fn with_expiration(self, exp: u32) -> Self {
+        Self {
+            authenticator: self.authenticator,
+            expirtation: Some(exp),
+        }
+    }
 }
 
 /// Verify the Authchain headers provided within request to identify a Decentraland user
