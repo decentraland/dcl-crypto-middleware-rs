@@ -18,7 +18,7 @@ pub enum WSAuthError {
 
 /// Trait that should be implemented by the type in charge of handling the websocket connection for [`authenticate_dcl_user_with_challenge`]
 #[async_trait::async_trait]
-pub trait AuthenticatedWebSocket {
+pub trait ChallengeAuthenticatedWebSocket {
     type Error;
     /// Sends the signature challenge to the client
     async fn send_signature_challenge(&self, challenge: &str) -> Result<(), Self::Error>;
@@ -42,7 +42,10 @@ pub trait AuthenticatedWebSocket {
 /// * `ws`: type implementing [`AuthenticatedWebSocket`]
 /// * `timeout`: Amount of seconds to wait for the client to send the auth chain
 ///
-pub async fn authenticate_dcl_user_with_challenge<Ws: AuthenticatedWebSocket, T: Web3Transport>(
+pub async fn authenticate_dcl_user_with_challenge<
+    Ws: ChallengeAuthenticatedWebSocket,
+    T: Web3Transport,
+>(
     ws: &mut Ws,
     timeout: u64,
     authenticator: Authenticator<T>,
@@ -80,7 +83,7 @@ mod tests {
 
     // Mock for simulating a connection
     #[async_trait::async_trait]
-    impl AuthenticatedWebSocket for InMemory {
+    impl ChallengeAuthenticatedWebSocket for InMemory {
         type Error = String;
         async fn send_signature_challenge(&self, challenge: &str) -> Result<(), Self::Error> {
             self.sender.send(challenge.to_string()).await.unwrap();
