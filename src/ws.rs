@@ -1,4 +1,4 @@
-use dcl_crypto::{Address, AuthChain, Authenticator};
+use dcl_crypto::{Address, AuthChain, Authenticator, Web3Transport};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -16,6 +16,17 @@ pub enum WSAuthError {
     ConnectionError,
 }
 
+/// Trait that should be implemented by the type in charge of handling the websocket connection for [`authenticate_dcl_user_with_challenge`]
+#[async_trait::async_trait]
+pub trait AuthenticatedWebSocket {
+    type Error;
+    /// Sends the signature challenge to the client
+    async fn send_signature_challenge(&self, challenge: &str) -> Result<(), Self::Error>;
+
+    /// Receives the authchain with signed challenge
+    async fn receive_signed_challenge(&mut self) -> Result<String, Self::Error>;
+}
+
 /// Authenticate a WebSocket Connection using the Decentraland's Authchain on a type that implements [`AuthenticatedWebSocket`]
 ///
 /// The function will send a signature challenge and waits for the client's signed authchain.
@@ -31,12 +42,11 @@ pub enum WSAuthError {
 /// * `ws`: type implementing [`AuthenticatedWebSocket`]
 /// * `timeout`: Amount of seconds to wait for the client to send the auth chain
 ///
-pub async fn authenticate_dcl_user<T: AuthenticatedWebSocket>(
-    ws: &mut T,
+pub async fn authenticate_dcl_user_with_challenge<Ws: AuthenticatedWebSocket, T: Web3Transport>(
+    ws: &mut Ws,
     timeout: u64,
+    authenticator: Authenticator<T>,
 ) -> Result<Address, WSAuthError> {
-    let authenticator = Authenticator::new();
-
     let message_to_be_firmed = format!("signature_challenge_{}", fastrand::u32(..));
 
     ws.send_signature_challenge(&message_to_be_firmed)
@@ -63,46 +73,10 @@ pub async fn authenticate_dcl_user<T: AuthenticatedWebSocket>(
     }
 }
 
-/// Trait that should be implemented by the type in charge of handling the websocket connection
-#[async_trait::async_trait]
-pub trait AuthenticatedWebSocket {
-    type Error;
-    /// Sends the signature challenge to the client
-    async fn send_signature_challenge(&self, challenge: &str) -> Result<(), Self::Error>;
-
-    /// Receives the authchain with signed challenge
-    async fn receive_signed_challenge(&mut self) -> Result<String, Self::Error>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_test_identity;
-
-    enum ReplyType {
-        InvalidMessageError,
-        InvalidSignatureError,
-        TimeoutError,
-        AuthChain,
-    }
-
-    // Mock for simulating a connection
-    struct InMemory {
-        sender: tokio::sync::mpsc::Sender<String>,
-        receiver: tokio::sync::mpsc::Receiver<String>,
-        reply_type: ReplyType,
-    }
-
-    impl InMemory {
-        fn new(reply_type: ReplyType) -> Self {
-            let chann = tokio::sync::mpsc::channel(1);
-            Self {
-                sender: chann.0,
-                receiver: chann.1,
-                reply_type,
-            }
-        }
-    }
+    use crate::test_utils::*;
 
     // Mock for simulating a connection
     #[async_trait::async_trait]
@@ -138,11 +112,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authtentication_should_return_ok() {
+    async fn authtentication_with_challenge_should_return_ok() {
         let mut in_memory_connection = InMemory::new(ReplyType::AuthChain);
-        let address = authenticate_dcl_user(&mut in_memory_connection, 1)
-            .await
-            .unwrap();
+        let address = authenticate_dcl_user_with_challenge(
+            &mut in_memory_connection,
+            1,
+            Authenticator::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             address.to_string(),
@@ -151,31 +129,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authtentication_should_return_err() {
+    async fn authtentication_with_challenge_should_return_err() {
         let mut in_memory_connection = InMemory::new(ReplyType::InvalidMessageError);
 
         assert!(matches!(
-            authenticate_dcl_user(&mut in_memory_connection, 1)
-                .await
-                .unwrap_err(),
+            authenticate_dcl_user_with_challenge(
+                &mut in_memory_connection,
+                1,
+                Authenticator::new()
+            )
+            .await
+            .unwrap_err(),
             WSAuthError::InvalidMessage
         ));
 
         let mut in_memory_connection = InMemory::new(ReplyType::TimeoutError);
 
         assert!(matches!(
-            authenticate_dcl_user(&mut in_memory_connection, 1)
-                .await
-                .unwrap_err(),
+            authenticate_dcl_user_with_challenge(
+                &mut in_memory_connection,
+                1,
+                Authenticator::new()
+            )
+            .await
+            .unwrap_err(),
             WSAuthError::Timeout
         ));
 
         let mut in_memory_connection = InMemory::new(ReplyType::InvalidSignatureError);
 
         assert!(matches!(
-            authenticate_dcl_user(&mut in_memory_connection, 1)
-                .await
-                .unwrap_err(),
+            authenticate_dcl_user_with_challenge(
+                &mut in_memory_connection,
+                1,
+                Authenticator::new()
+            )
+            .await
+            .unwrap_err(),
             WSAuthError::InvalidSignature
         ))
     }

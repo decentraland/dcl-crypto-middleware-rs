@@ -16,7 +16,7 @@ const DEFAULT_EXPIRATION: u32 = 1000 * 60;
 #[derive(Debug)]
 pub enum AuthMiddlewareError {
     /// A provided header doesn't meet the requirements to be a valid AuthLink of the Authchain
-    NotAuthLink,
+    InvalidMessage,
     /// The provided timestamp within headers is not valid. It's empty or not a number
     InvalidTimestamp,
     /// The provided metadata within headers is not valid. It's empty.
@@ -45,14 +45,21 @@ impl Default for VerificationOptions<WithoutTransport> {
 }
 
 impl<T> VerificationOptions<T> {
-    pub fn with_authenticator(self, authenticator: Authenticator<T>) -> Self {
+    pub fn with_authenticator(authenticator: Authenticator<T>) -> Self {
         Self {
+            authenticator,
+            expirtation: None,
+        }
+    }
+
+    pub fn authenticator<U>(self, authenticator: Authenticator<U>) -> VerificationOptions<U> {
+        VerificationOptions {
             authenticator,
             expirtation: self.expirtation,
         }
     }
 
-    pub fn with_expiration(self, exp: u32) -> Self {
+    pub fn expiration(self, exp: u32) -> Self {
         Self {
             authenticator: self.authenticator,
             expirtation: Some(exp),
@@ -111,7 +118,7 @@ fn extract_auth_chain(headers: &HashMap<String, String>) -> Result<AuthChain, Au
         if let Ok(auth_link) = AuthLink::parse(header) {
             auth_links.push(auth_link);
         } else {
-            return Err(AuthMiddlewareError::NotAuthLink);
+            return Err(AuthMiddlewareError::InvalidMessage);
         }
 
         index += 1;
@@ -167,7 +174,7 @@ fn verify_expiration(ts: u128, expiration: u32) -> Result<(), AuthMiddlewareErro
 mod tests {
     use std::time::Duration;
 
-    use crate::create_test_identity;
+    use crate::test_utils::create_test_identity;
 
     use super::*;
 
@@ -430,7 +437,7 @@ mod tests {
 
         assert!(matches!(
             extract_auth_chain(&mapped_headers).unwrap_err(),
-            AuthMiddlewareError::NotAuthLink
+            AuthMiddlewareError::InvalidMessage
         ))
     }
 
