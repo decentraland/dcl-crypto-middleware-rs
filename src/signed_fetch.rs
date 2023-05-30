@@ -205,6 +205,9 @@ mod tests {
             ("X-Identity-Metadata".to_string(), "{}".to_string()),
         ]);
 
+        let headers_str = serde_json::to_string_pretty(&mapped_headers).unwrap();
+        let mapped_headers = serde_json::from_str::<HashMap<String, String>>(&headers_str).unwrap();
+
         verify(
             "GET",
             "/",

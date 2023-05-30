@@ -36,13 +36,8 @@ pub async fn authenticate_dcl_user_with_signed_headers<
     match tokio::time::timeout(Duration::from_secs(timeout), ws.receive_signed_headers()).await {
         Ok(Ok(client_response)) => {
             if let Ok(signed_headers) =
-                serde_json::from_str::<HashMap<String, Value>>(&client_response)
+                serde_json::from_str::<HashMap<String, String>>(&client_response)
             {
-                let signed_headers = signed_headers
-                    .iter()
-                    .map(|(key, value)| (key.to_owned(), value.to_string()))
-                    .collect::<HashMap<String, String>>();
-
                 signed_fetch::verify(
                     method,
                     path,
