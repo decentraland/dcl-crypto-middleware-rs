@@ -40,7 +40,14 @@ pub async fn authenticate_dcl_user_with_signed_headers<
             {
                 let signed_headers = signed_headers
                     .iter()
-                    .map(|(key, value)| (key.to_owned(), value.to_string()))
+                    .map(|(key, value)| {
+                        let val = match value {
+                            Value::Object(_) | Value::Number(_) => value.to_string(),
+                            Value::String(s) => s.to_owned(),
+                            _ => "".to_string(),
+                        };
+                        (key.to_owned(), val)
+                    })
                     .collect::<HashMap<String, String>>();
 
                 signed_fetch::verify(
