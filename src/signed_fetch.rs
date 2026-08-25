@@ -25,6 +25,10 @@ pub enum AuthMiddlewareError {
     Unauthotized,
     /// The request's timestamp expired so the request is unauthorized
     Expired,
+    /// A legacy-signed request delivered a declared metadata key under another spelling, or under
+    /// two spellings at once. Only returned when [`VerificationOptions::accept_legacy_payload`] is
+    /// in use.
+    NonCanonicalMetadataKey,
 }
 
 /// Options that must be provided to [`verify`] function
@@ -33,6 +37,9 @@ pub struct VerificationOptions<T> {
     authenticator: Authenticator<T>,
     /// Optional expiration time. The default is `1000 * 60` ms
     expirtation: Option<u32>,
+    /// When set, the pre-6.0.0 folded payload is accepted as a fallback, and a legacy request must
+    /// spell these keys exactly as declared. See [`VerificationOptions::accept_legacy_payload`].
+    canonical_metadata_keys: Option<Vec<String>>,
 }
 
 impl Default for VerificationOptions<WithoutTransport> {
@@ -40,6 +47,7 @@ impl Default for VerificationOptions<WithoutTransport> {
         Self {
             authenticator: Authenticator::new(),
             expirtation: None,
+            canonical_metadata_keys: None,
         }
     }
 }
@@ -49,6 +57,7 @@ impl<T> VerificationOptions<T> {
         Self {
             authenticator,
             expirtation: None,
+            canonical_metadata_keys: None,
         }
     }
 
@@ -56,6 +65,7 @@ impl<T> VerificationOptions<T> {
         VerificationOptions {
             authenticator,
             expirtation: self.expirtation,
+            canonical_metadata_keys: self.canonical_metadata_keys,
         }
     }
 
@@ -63,6 +73,30 @@ impl<T> VerificationOptions<T> {
         Self {
             authenticator: self.authenticator,
             expirtation: Some(exp),
+            canonical_metadata_keys: self.canonical_metadata_keys,
+        }
+    }
+
+    /// Also accept signatures built with the pre-6.0.0 payload, where the whole joined string was
+    /// folded rather than only the method and the path.
+    ///
+    /// Opt-in, and deliberately so: accepting that format means metadata *values* are no longer
+    /// covered by the signature for those requests. Use it only while clients migrate.
+    ///
+    /// `canonical_keys` are the metadata keys the service authorizes on, in the spelling it reads
+    /// them. A legacy request delivering one of them under another spelling -- or under two at once
+    /// -- is refused with [`AuthMiddlewareError::NonCanonicalMetadataKey`] rather than having its
+    /// metadata rewritten. Pass an empty slice ONLY if no authorization decision in the service
+    /// reads metadata at all; there is then nothing whose spelling could change an outcome.
+    ///
+    /// The current format is always tried first. The fallback runs only when that fails.
+    pub fn accept_legacy_payload(self, canonical_keys: &[&str]) -> Self {
+        Self {
+            authenticator: self.authenticator,
+            expirtation: self.expirtation,
+            canonical_metadata_keys: Some(
+                canonical_keys.iter().map(|key| key.to_string()).collect(),
+            ),
         }
     }
 }
@@ -101,13 +135,31 @@ pub async fn verify<T: Web3Transport>(
         return Err(AuthMiddlewareError::InvalidMetadata);
     };
 
-    let payload = create_payload(method, path, timestamp, metadata);
-
     let exp = options.expirtation.unwrap_or(DEFAULT_EXPIRATION);
 
     verify_expiration(ts_number, exp)?;
 
-    verify_sign(options.authenticator, auth_chain, &payload).await
+    let payload = create_payload(method, path, timestamp, metadata);
+
+    match verify_sign(&options.authenticator, &auth_chain, &payload).await {
+        Ok(address) => Ok(address),
+        Err(err) => {
+            // The current format is always tried first, so a service that has not opted in behaves
+            // exactly as before this fallback existed.
+            let Some(canonical_keys) = options.canonical_metadata_keys.as_ref() else {
+                return Err(err);
+            };
+
+            // Guarded before the second signature check, not after: the guard is free and the check
+            // may cost a web3 round-trip for a contract wallet. A request refused either way should
+            // not pay for it.
+            assert_legacy_metadata_keys(metadata, canonical_keys)?;
+
+            let legacy = create_legacy_payload(method, path, timestamp, metadata);
+
+            verify_sign(&options.authenticator, &auth_chain, &legacy).await
+        }
+    }
 }
 
 fn extract_auth_chain(headers: &HashMap<String, String>) -> Result<AuthChain, AuthMiddlewareError> {
@@ -139,17 +191,86 @@ fn verify_ts(ts: &str) -> Result<u128, AuthMiddlewareError> {
         .map_err(|_| AuthMiddlewareError::InvalidTimestamp)
 }
 
+/// Builds the payload an ADR-44 signature covers.
+///
+/// The method and the path are lowercased; the metadata is joined VERBATIM, exactly as the
+/// `x-identity-metadata` header delivers it.
+///
+/// That last part is the whole point. This used to lowercase the joined string, metadata included,
+/// which left the metadata's casing outside the signature: a client could sign
+/// `{"signer":"..."}` and deliver `{"Signer":"..."}` under the same valid signature, and a service
+/// reading the delivered header would see a different value than the one that was signed. Joining
+/// the bytes as delivered is what binds them.
 fn create_payload(method: &str, path: &str, timestamp: &str, metadata: &str) -> String {
+    [
+        method.to_lowercase().as_str(),
+        path.to_lowercase().as_str(),
+        timestamp,
+        metadata,
+    ]
+    .join(":")
+}
+
+/// The pre-6.0.0 payload: the whole joined string folded, metadata included.
+///
+/// Kept only so [`VerificationOptions::accept_legacy_payload`] can still verify clients that have
+/// not migrated. Never used unless a service opts in.
+fn create_legacy_payload(method: &str, path: &str, timestamp: &str, metadata: &str) -> String {
     [method, path, timestamp, metadata].join(":").to_lowercase()
 }
 
+/// Refuses legacy-signed metadata that delivers a declared key under another spelling.
+///
+/// The legacy payload folds the metadata, so `{"Signer":...}` and `{"signer":...}` share one valid
+/// signature. A service comparing `metadata["signer"]` reads the first as absent. Requiring the
+/// declared spelling removes that ambiguity rather than resolving it: nothing is rewritten, the
+/// request is refused.
+///
+/// Only keys are checked. Values sit outside the legacy signature too and no key list can bind
+/// them -- that is the cost of accepting the older format, and it is why this is opt-in.
+fn assert_legacy_metadata_keys(
+    metadata: &str,
+    canonical_keys: &[String],
+) -> Result<(), AuthMiddlewareError> {
+    if canonical_keys.is_empty() {
+        return Ok(());
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(metadata).map_err(|_| AuthMiddlewareError::InvalidMetadata)?;
+
+    let Some(object) = parsed.as_object() else {
+        // A non-object cannot carry the fields a service reads, and the legacy signature binds
+        // none of it. Refused rather than waved through.
+        return Err(AuthMiddlewareError::InvalidMetadata);
+    };
+
+    for declared in canonical_keys {
+        let folded = declared.to_lowercase();
+        let delivered: Vec<&String> = object
+            .keys()
+            .filter(|key| key.to_lowercase() == folded)
+            .collect();
+
+        match delivered.len() {
+            0 => continue,
+            1 if delivered[0] == declared => continue,
+            // Either spelled differently, or delivered under two spellings at once -- in which case
+            // which one a service reads depends on key order rather than on anything signed.
+            _ => return Err(AuthMiddlewareError::NonCanonicalMetadataKey),
+        }
+    }
+
+    Ok(())
+}
+
 async fn verify_sign<T: Web3Transport>(
-    authenticator: Authenticator<T>,
-    auth_chain: AuthChain,
+    authenticator: &Authenticator<T>,
+    auth_chain: &AuthChain,
     payload: &str,
 ) -> Result<Address, AuthMiddlewareError> {
     Ok(authenticator
-        .verify_signature(&auth_chain, payload)
+        .verify_signature(auth_chain, payload)
         .await
         .map_err(|_| AuthMiddlewareError::Unauthotized)?
         .to_owned())
@@ -212,6 +333,7 @@ mod tests {
             VerificationOptions {
                 authenticator: Authenticator::new(),
                 expirtation: None,
+                canonical_metadata_keys: None,
             },
         )
         .await
@@ -245,6 +367,7 @@ mod tests {
                 VerificationOptions {
                     authenticator: Authenticator::new(),
                     expirtation: None,
+                    canonical_metadata_keys: None,
                 },
             )
             .await
@@ -276,6 +399,7 @@ mod tests {
                 VerificationOptions {
                     authenticator: Authenticator::new(),
                     expirtation: None,
+                    canonical_metadata_keys: None,
                 },
             )
             .await
@@ -307,6 +431,7 @@ mod tests {
                 VerificationOptions {
                     authenticator: Authenticator::new(),
                     expirtation: None,
+                    canonical_metadata_keys: None,
                 },
             )
             .await
@@ -346,6 +471,7 @@ mod tests {
                 VerificationOptions {
                     authenticator: Authenticator::new(),
                     expirtation: None,
+                    canonical_metadata_keys: None,
                 },
             )
             .await
@@ -386,6 +512,7 @@ mod tests {
                 VerificationOptions {
                     authenticator: Authenticator::new(),
                     expirtation: None,
+                    canonical_metadata_keys: None,
                 },
             )
             .await
@@ -464,8 +591,8 @@ mod tests {
         let signed_fetch = identity.sign_payload("get:/api/events:1684869538587:{}");
 
         let address = verify_sign(
-            Authenticator::new(),
-            signed_fetch,
+            &Authenticator::new(),
+            &signed_fetch,
             "get:/api/events:1684869538587:{}",
         )
         .await
@@ -484,8 +611,8 @@ mod tests {
 
         assert!(matches!(
             verify_sign(
-                Authenticator::new(),
-                signed_fetch,
+                &Authenticator::new(),
+                &signed_fetch,
                 "get:/api/events:1684869538687:{}",
             )
             .await
@@ -514,5 +641,165 @@ mod tests {
             .as_millis();
 
         assert!(verify_expiration(past, DEFAULT_EXPIRATION).is_err());
+    }
+
+    /// Builds signed-fetch headers from a chain, so a test can choose the payload it signs and the
+    /// metadata it delivers independently. That split is the whole subject here.
+    fn headers_from(
+        chain: &AuthChain,
+        timestamp: &str,
+        delivered_metadata: &str,
+    ) -> HashMap<String, String> {
+        let links = serde_json::to_value(chain).unwrap();
+        let mut headers = HashMap::new();
+
+        for (index, link) in links.as_array().unwrap().iter().enumerate() {
+            headers.insert(
+                format!("{}{}", AUTH_CHAIN_HEADER_PREFIX, index),
+                serde_json::to_string(link).unwrap(),
+            );
+        }
+
+        headers.insert(AUTH_TIMESTAMP_HEADER.to_string(), timestamp.to_string());
+        headers.insert(
+            AUTH_METADATA_HEADER.to_string(),
+            delivered_metadata.to_string(),
+        );
+
+        headers
+    }
+
+    fn now_ms() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string()
+    }
+
+    /// Metadata that makes folding lossy. All-lowercase metadata folds to itself, so it verifies
+    /// identically under both payloads and would prove nothing.
+    const MIXED_CASE_METADATA: &str = r#"{"realmName":"Main","signer":"dcl:explorer"}"#;
+
+    #[tokio::test]
+    async fn verify_should_bind_the_metadata_bytes_into_the_signature() {
+        let identity = create_test_identity();
+        let timestamp = now_ms();
+        let payload = create_payload("GET", "/api/events", &timestamp, MIXED_CASE_METADATA);
+        let chain = identity.sign_payload(payload);
+
+        // Delivered exactly as signed: verifies.
+        let headers = headers_from(&chain, &timestamp, MIXED_CASE_METADATA);
+        assert!(verify(
+            "GET",
+            "/api/events",
+            headers,
+            VerificationOptions::default()
+        )
+        .await
+        .is_ok());
+
+        // Same signature, one key re-cased after signing. Before the metadata bytes were bound this
+        // still verified, because folding collapsed both spellings to one payload.
+        let tampered = r#"{"RealmName":"Main","signer":"dcl:explorer"}"#;
+        let headers = headers_from(&chain, &timestamp, tampered);
+        assert!(matches!(
+            verify(
+                "GET",
+                "/api/events",
+                headers,
+                VerificationOptions::default()
+            )
+            .await
+            .unwrap_err(),
+            AuthMiddlewareError::Unauthotized
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_should_refuse_the_legacy_payload_unless_a_service_opts_in() {
+        let identity = create_test_identity();
+        let timestamp = now_ms();
+        let legacy = create_legacy_payload("GET", "/api/events", &timestamp, MIXED_CASE_METADATA);
+        let chain = identity.sign_payload(legacy);
+        let headers = headers_from(&chain, &timestamp, MIXED_CASE_METADATA);
+
+        assert!(matches!(
+            verify(
+                "GET",
+                "/api/events",
+                headers,
+                VerificationOptions::default()
+            )
+            .await
+            .unwrap_err(),
+            AuthMiddlewareError::Unauthotized
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_should_accept_the_legacy_payload_when_a_service_opts_in() {
+        let identity = create_test_identity();
+        let timestamp = now_ms();
+        let legacy = create_legacy_payload("GET", "/api/events", &timestamp, MIXED_CASE_METADATA);
+        let chain = identity.sign_payload(legacy);
+        let headers = headers_from(&chain, &timestamp, MIXED_CASE_METADATA);
+
+        assert!(verify(
+            "GET",
+            "/api/events",
+            headers,
+            VerificationOptions::default().accept_legacy_payload(&["signer"])
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_should_refuse_a_legacy_request_that_respells_a_declared_key() {
+        let identity = create_test_identity();
+        let timestamp = now_ms();
+        // Folded, this signs identically to the same object spelling the key `signer`, so only the
+        // declared-key guard can refuse it. Read as absent, a service gating on `signer` would see
+        // metadata that names a signer as carrying none.
+        let delivered = r#"{"realmName":"Main","Signer":"dcl:explorer"}"#;
+        let legacy = create_legacy_payload("GET", "/api/events", &timestamp, delivered);
+        let chain = identity.sign_payload(legacy);
+        let headers = headers_from(&chain, &timestamp, delivered);
+
+        assert!(matches!(
+            verify(
+                "GET",
+                "/api/events",
+                headers,
+                VerificationOptions::default().accept_legacy_payload(&["signer"])
+            )
+            .await
+            .unwrap_err(),
+            AuthMiddlewareError::NonCanonicalMetadataKey
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_should_refuse_a_legacy_request_delivering_two_spellings_at_once() {
+        let identity = create_test_identity();
+        let timestamp = now_ms();
+        // Which one a service reads depends on key order, not on anything the signature pinned.
+        let delivered = r#"{"signer":"dcl:explorer","Signer":"decentraland-kernel-scene"}"#;
+        let legacy = create_legacy_payload("GET", "/api/events", &timestamp, delivered);
+        let chain = identity.sign_payload(legacy);
+        let headers = headers_from(&chain, &timestamp, delivered);
+
+        assert!(matches!(
+            verify(
+                "GET",
+                "/api/events",
+                headers,
+                VerificationOptions::default().accept_legacy_payload(&["signer"])
+            )
+            .await
+            .unwrap_err(),
+            AuthMiddlewareError::NonCanonicalMetadataKey
+        ));
     }
 }
