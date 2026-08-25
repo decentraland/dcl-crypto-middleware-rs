@@ -1,6 +1,6 @@
 [package]
 name = "dcl-crypto-middleware-rs"
-version = "0.2.1"
+version = "0.3.0"
 description = "Utils to authenticate Decentraland users on Rust services"
 repository = "https://github.com/decentraland/dcl-crypto-middleware-rs"
 readme = "./README.md"
@@ -23,5 +23,5 @@ serde_json = "1.0"
 [features]
 default = ["ws", "ws_signed_headers", "signed_fetch"]
 ws = ["dep:fastrand", "dep:async-trait", "dep:tokio"]
-signed_fetch = []
+signed_fetch = ["dep:serde_json"]
 ws_signed_headers = ["signed_fetch", "dep:serde_json"]
